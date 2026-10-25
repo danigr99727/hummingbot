@@ -1,3 +1,4 @@
+import asyncio
 import time
 from decimal import Decimal
 
@@ -101,9 +102,23 @@ class ReyaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     async def listen_for_order_book_snapshots(self, ev_loop, output):
         # REST and WS have no common sequence; never splice periodic REST reads into a live diff stream.
+        queue = self._message_queue[self._snapshot_messages_queue_key]
         while True:
-            message = await self._message_queue[self._snapshot_messages_queue_key].get()
-            await self._parse_order_book_snapshot_message(message, output)
+            try:
+                message = await queue.get()
+                await self._parse_order_book_snapshot_message(message, output)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Invalid Reya depth message; reconnecting for a fresh snapshot")
+                self._books.clear()
+                while not queue.empty():
+                    queue.get_nowait()
+                if self._ws_assistant is not None:
+                    try:
+                        await self._ws_assistant.disconnect()
+                    except Exception:
+                        self.logger().warning("Error disconnecting Reya depth stream", exc_info=True)
 
     async def _parse_order_book_snapshot_message(self, raw_message, message_queue):
         data = self._contents(raw_message)

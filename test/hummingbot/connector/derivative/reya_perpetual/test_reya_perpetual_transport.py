@@ -86,6 +86,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         order = self.track()
         self.connector._find_order = AsyncMock(return_value={"orderId": "123", "status": "FILLED", "cumQty": "1", "lastUpdateAt": 1000})
         execution = {"sequenceNumber": 3, "takerAccountId": 42, "takerOrderId": "123", "qty": "1", "price": "100", "takerFee": "0.03", "timestamp": 1000}
+        self.assertTrue(self.connector._trade_update(execution, order).is_taker)
+        maker_execution = {"sequenceNumber": 4, "makerAccountId": 42, "makerOrderId": "123", "qty": "1", "price": "100", "makerFee": "-0.01", "timestamp": 1000}
+        self.assertFalse(self.connector._trade_update(maker_execution, order).is_taker)
 
         async def history(resource, *args):
             for row in ([execution] if resource == "perpExecutions" else []):
@@ -98,6 +101,28 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(iter(self.connector.account_positions.values())).amount, Decimal("-2"))
         await self.connector._update_positions()
         self.assertEqual(self.connector.account_positions, {})
+
+    async def test_depth_parser_recovers_after_malformed_message(self):
+        source = self.connector._create_order_book_data_source()
+        queue = source._message_queue[source._snapshot_messages_queue_key]
+        output = asyncio.Queue()
+        snapshot = {"type": "subscribed", "contents": {"type": "SNAPSHOT", "symbol": "BTCRUSDPERP", "updatedAt": 1000, "bids": [{"px": "100", "qty": "1"}], "asks": []}}
+
+        async def reconnect():
+            queue.put_nowait(snapshot)
+
+        source._ws_assistant = SimpleNamespace(disconnect=AsyncMock(side_effect=reconnect))
+        queue.put_nowait({"type": "channel_data", "data": {"symbol": "BTCRUSDPERP", "type": "UPDATE"}})
+        listener = asyncio.create_task(source.listen_for_order_book_snapshots(None, output))
+        try:
+            message = await asyncio.wait_for(output.get(), 1)
+            self.assertEqual(message.bids[0].price, 100)
+            source._ws_assistant.disconnect.assert_awaited_once()
+            self.assertFalse(listener.done())
+        finally:
+            listener.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await listener
 
     async def test_market_close_fee_tier_and_leverage(self):
         with patch.object(type(self.connector), "get_price", return_value=Decimal("100")):

@@ -281,7 +281,8 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
                                              flat_fees=[TokenAmount("RUSD", Decimal(row.get(role + "Fee", "0")))])
         qty, price = Decimal(row["qty"]), Decimal(row["price"])
         return TradeUpdate(str(row["sequenceNumber"]), order.client_order_id, order.exchange_order_id,
-                           order.trading_pair, row["timestamp"] / 1000, price, qty, qty * price, fee)
+                           order.trading_pair, row["timestamp"] / 1000, price, qty, qty * price, fee,
+                           is_taker=role == "taker")
 
     async def _all_trade_updates_for_order(self, order):
         if not order.exchange_order_id:
