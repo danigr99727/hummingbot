@@ -35,11 +35,11 @@ def scale_e18(value: Decimal) -> int:
 
 
 class ReyaPerpetualAuth(AuthBase):
-    def __init__(self, private_key, market_ids, chain_id=CONSTANTS.CHAIN_ID, gateway=CONSTANTS.ORDERS_GATEWAY):
+    def __init__(self, private_key, market_ids, domain=CONSTANTS.DEFAULT_DOMAIN):
         self._wallet = Account.from_key(private_key)
         self._market_ids = market_ids
-        self._chain_id = chain_id
-        self._domain = {"name": "Reya", "version": "1", "verifyingContract": gateway}
+        self._chain_id = CONSTANTS.CHAIN_IDS[domain]
+        self._domain = {"name": "Reya", "version": "1", "verifyingContract": CONSTANTS.ORDERS_GATEWAYS[domain]}
         self._last_nonce = 0
 
     @property
@@ -53,7 +53,7 @@ class ReyaPerpetualAuth(AuthBase):
     def sign_payload(self, path, payload):
         data = dict(payload)
         nonce = int(data.get("nonce", self.nonce()))
-        deadline = int(data.get("deadline", int(time.time()) + 30))
+        deadline = int(data.get("deadline", int(time.time()) + CONSTANTS.SIGNATURE_DEADLINE))
         market_id = self._market_ids[data["symbol"]] if data.get("symbol") else 0
         if path == "createOrder":
             if data.get("orderType") != "LIMIT":
