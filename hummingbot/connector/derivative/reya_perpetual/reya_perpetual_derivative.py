@@ -411,11 +411,11 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
             quantity = Decimal(row["qty"])
             if not quantity.is_finite():
                 raise IOError("Reya position quantity is invalid")
+            bases[row["symbol"]] = self._position_base(row)
             # A closed position can retain its base row without any valuation.
             if quantity == 0:
                 continue
             unrealized_pnl, timestamp = self._position_risk(row)
-            bases[row["symbol"]] = self._position_base(row)
             fresh_at = min(fresh_at, timestamp / 1000)
             pair = await self.trading_pair_associated_to_exchange_symbol(row["symbol"])
             side = PositionSide.LONG if row["side"] == "B" else PositionSide.SHORT
@@ -489,14 +489,17 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         for row in rows:
             if int(row["accountId"]) != self._account_id:
                 continue
-            self._poll_notifier.set()
+            quantity = Decimal(row["qty"])
+            if not quantity.is_finite():
+                raise ValueError("Reya position notification quantity is invalid")
             symbol, base = row["symbol"], self._position_base(row)
             invalidates |= bases.get(symbol) != base
-            if Decimal(row["qty"]) == 0:
-                bases.pop(symbol, None)
-                invalidates = True
-            else:
-                bases[symbol] = base
+            bases[symbol] = base
+            # ADL-adjusted closed rows may repeat on every price refresh. Remember
+            # the close, but require no valuation and invalidate only on a base change.
+            if quantity == 0:
+                continue
+            self._poll_notifier.set()
             try:
                 self._position_risk(row)
             except (IOError, ValueError, TypeError, ArithmeticError):

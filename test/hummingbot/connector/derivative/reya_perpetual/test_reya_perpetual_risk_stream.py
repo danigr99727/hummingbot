@@ -56,8 +56,9 @@ class RiskStreamTests(unittest.IsolatedAsyncioTestCase):
         await self.emit(self.frame([fixtures.position_row(qty="3", unrealizedPnl="9")]))
         self.assertEqual(self.connector._account_state_version, 1)
         self.assertIn("ETHRUSDPERP", self.connector._position_bases)
-        await self.emit(self.frame([fixtures.position_row(qty="0", unrealizedPnl=None)]))
-        self.assertNotIn("BTCRUSDPERP", self.connector._position_bases)
+        closed = fixtures.position_row(qty="0", unrealizedPnl=None)
+        await self.emit(self.frame([closed]))
+        self.assertEqual(self.connector._position_bases["BTCRUSDPERP"], self.connector._position_base(closed))
         self.assertIn("ETHRUSDPERP", self.connector._position_bases)
         self.assertEqual(self.connector._account_state_version, 2)
 
@@ -76,12 +77,55 @@ class RiskStreamTests(unittest.IsolatedAsyncioTestCase):
         self.connector._api_get.return_value = [closed]
         await self.connector._update_positions()
         self.assertEqual(self.connector.account_positions, {})
-        self.assertEqual(self.connector._position_bases, {})
+        self.assertEqual(self.connector._position_bases, {"BTCRUSDPERP": self.connector._position_base(closed)})
         self.assertEqual(self.connector.get_available_balance("RUSD"), 900)
         self.connector._api_get.return_value = [fixtures.position_row(qty="NaN")]
         with self.assertRaisesRegex(IOError, "quantity is invalid"):
             await self.connector._update_positions()
         self.assertEqual(self.connector.get_available_balance("RUSD"), 0)
+
+    async def test_repeated_closed_rows_do_not_invalidate_pending_rest_or_recovered_budget(self):
+        await self.ready()
+        closed = fixtures.position_row(qty="0")
+        del closed["unrealizedPnl"]
+        del closed["pricesUpdatedAt"]
+        await self.emit(self.frame([closed]))
+        self.assertEqual(self.connector.get_available_balance("RUSD"), 0)
+        self.assertEqual(self.connector._account_state_version, 1)
+        positions_started, balances_started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def response(path_url, **kwargs):
+            if path_url.endswith("positions"):
+                positions_started.set()
+                await release.wait()
+                return [closed]
+            if path_url.endswith("accountSummaries"):
+                balances_started.set()
+                await release.wait()
+                return [{"accountId": 42, "marginBalance": "1000", "freeCollateral": "900"}]
+            return []
+
+        self.connector._api_get.side_effect = response
+        self.connector._update_order_status = AsyncMock()
+        poll = asyncio.create_task(self.connector._status_polling_loop_fetch_updates())
+        await positions_started.wait()
+        await balances_started.wait()
+        self.connector._poll_notifier.clear()
+        await self.emit(*(self.frame([closed]) for _ in range(20)))
+        self.assertEqual(self.connector._account_state_version, 1)
+        self.assertFalse(self.connector._poll_notifier.is_set())
+        release.set()
+        await poll
+        self.assertEqual(self.connector.account_positions, {})
+        self.assertEqual(self.connector.get_available_balance("RUSD"), 900)
+        await self.emit(*(self.frame([closed]) for _ in range(20)))
+        self.assertEqual(self.connector._account_state_version, 1)
+        self.assertEqual(self.connector.get_available_balance("RUSD"), 900)
+        await self.emit(self.frame([closed], unavailableAccountIds=[42]))
+        self.assertEqual(self.connector._account_state_version, 2)
+        self.assertEqual(self.connector.get_available_balance("RUSD"), 0)
+        await self.emit(self.frame([{**closed, "lastTradeSequenceNumber": 8}]))
+        self.assertEqual(self.connector._account_state_version, 3)
 
     async def test_foreign_account_updates_and_unavailability_do_not_invalidate(self):
         await self.ready()
@@ -92,6 +136,7 @@ class RiskStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_stale_unavailable_and_malformed_risk_fail_closed(self):
         frames = [self.frame([fixtures.position_row(unrealizedPnl=None)]),
                   self.frame([fixtures.position_row(unrealizedPnl="NaN")]),
+                  self.frame([fixtures.position_row(qty="NaN")]),
                   self.frame([fixtures.position_row(pricesUpdatedAt=int((time.time() - 31) * 1000))]),
                   self.frame([], unavailableAccountIds=[42]),
                   self.frame([], unavailableAccountIds="42"), self.frame({}),
