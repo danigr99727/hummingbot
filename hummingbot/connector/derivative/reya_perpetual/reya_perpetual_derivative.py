@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 from decimal import Decimal
 
@@ -45,6 +46,7 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         self._signing_lock = asyncio.Lock()
         self._reya_auth = ReyaPerpetualAuth(reya_perpetual_private_key, self._market_ids) if reya_perpetual_private_key else None
         self._balance_read_at = 0
+        self._positions_read_at = 0
         self._external_orders = False
         self._maker_fee = Decimal("0")
         self._taker_fee = Decimal("0.0003")
@@ -339,7 +341,8 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         self._balance_read_at = time.time()
 
     def get_available_balance(self, currency):
-        if currency != "RUSD" or self._external_orders or time.time() - self._balance_read_at > 30:
+        if (currency != "RUSD" or self._external_orders or time.time() - self._balance_read_at > 30
+                or time.time() - self._positions_read_at > 30):
             return Decimal("0")
         available = super().get_available_balance(currency)
         # The API excludes order holds. Reserve each tracked order in full until terminal reconciliation.
@@ -351,21 +354,38 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         return max(Decimal("0"), available)
 
     async def _update_positions(self):
-        rows = await self._api_get(path_url=self._wallet_path("positionRisk"), params={"accountId": self._account_id})
-        active = set()
+        # Keep this guard independent of balance polling: a successful balance read
+        # must not make missing or stale position valuations usable again.
+        self._positions_read_at = 0
+        rows = await self._api_get(path_url=self._wallet_path("positions"))
+        fresh_at = time.time()
+        positions = {}
         for row in rows:
             if int(row["accountId"]) != self._account_id:
                 continue
+            timestamp = row.get("pricesUpdatedAt")
+            if (not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp)
+                    or timestamp <= 0 or time.time() * 1000 - timestamp > 30000):
+                raise IOError("Reya position valuation prices are missing or stale")
+            if row.get("unrealizedPnl") is None:
+                raise IOError("Reya position unrealized PnL is unavailable")
+            unrealized_pnl = Decimal(row["unrealizedPnl"])
+            if not unrealized_pnl.is_finite():
+                raise IOError("Reya position unrealized PnL is invalid")
+            fresh_at = min(fresh_at, timestamp / 1000)
             pair = await self.trading_pair_associated_to_exchange_symbol(row["symbol"])
             side = PositionSide.LONG if row["side"] == "B" else PositionSide.SHORT
             key = self._perpetual_trading.position_key(pair, side)
-            active.add(key)
-            self._perpetual_trading.set_position(key, Position(pair, side, Decimal(row["unrealizedPnl"]),
-                                                               Decimal(row["avgEntryPrice"]), Decimal(row["qty"]) * (1 if side == PositionSide.LONG else -1),
-                                                               Decimal(self.get_leverage(pair))))
+            positions[key] = Position(pair, side, unrealized_pnl, Decimal(row["avgEntryPrice"]),
+                                      Decimal(row["qty"]) * (1 if side == PositionSide.LONG else -1),
+                                      Decimal(self.get_leverage(pair)))
+        # Validate the complete account snapshot before changing any tracked positions.
+        for key, position in positions.items():
+            self._perpetual_trading.set_position(key, position)
         for key in list(self.account_positions):
-            if key not in active:
+            if key not in positions:
                 self._perpetual_trading.remove_position(key)
+        self._positions_read_at = fresh_at
 
     async def _trading_pair_position_mode_set(self, mode, trading_pair):
         return mode == PositionMode.ONEWAY, "Reya supports one-way cross margin only"
@@ -385,4 +405,5 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
             # Do not treat orderChanges.cumQty or executionBusts as settled fills.
             if event.get("type") in ("subscribed", "channel_data"):
                 self._balance_read_at = 0
+                self._positions_read_at = 0
                 self._poll_notifier.set()

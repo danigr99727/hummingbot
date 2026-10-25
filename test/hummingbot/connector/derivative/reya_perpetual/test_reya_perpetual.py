@@ -4,7 +4,7 @@ import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hummingbot.connector.derivative.reya_perpetual.reya_perpetual_auth import ReyaPerpetualAuth, wire_client_id
 from hummingbot.connector.derivative.reya_perpetual.reya_perpetual_derivative import (
@@ -17,6 +17,11 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 VECTORS = json.loads(Path(__file__).with_name("signatures.json").read_text())
 MARKET = {"symbol": "BTCRUSDPERP", "marketId": 2, "status": "TRADING", "qtyStepSize": "0.0001",
           "tickSize": "0.01", "minOrderQty": "0.0001", "initialMarginParameter": "0.02"}
+
+
+def position_row(**changes):
+    return {"accountId": 42, "symbol": "BTCRUSDPERP", "side": "B", "qty": "2", "avgEntryPrice": "101",
+            "unrealizedPnl": "2", "pricesUpdatedAt": int(time.time() * 1000), **changes}
 
 
 class AuthTests(unittest.TestCase):
@@ -78,14 +83,107 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(order.is_failure)
 
     async def test_margin_budget_and_stale_data(self):
-        self.connector._api_get.side_effect = [[{"accountId": 42, "marginBalance": "1000", "freeCollateral": "900",
-                                                "pricesUpdatedAt": int(time.time() * 1000)}], []]
+        self.connector._api_get.side_effect = [[], [{"accountId": 42, "marginBalance": "1000", "freeCollateral": "900",
+                                                     "pricesUpdatedAt": int(time.time() * 1000)}], []]
+        await self.connector._update_positions()
         await self.connector._update_balances()
         self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("900"))
         self.track()
         self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("800"))
         self.connector._balance_read_at = 0
         self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("0"))
+
+    async def test_positions_use_existing_resource_and_ignore_other_accounts(self):
+        self.connector._api_get.return_value = [position_row(), {"accountId": 99, "symbol": "UNKNOWN"}]
+        await self.connector._update_positions()
+        self.connector._api_get.assert_awaited_once_with(path_url=self.connector._wallet_path("positions"))
+        position = next(iter(self.connector.account_positions.values()))
+        self.assertEqual(position.amount, Decimal("2"))
+        self.assertEqual(position.unrealized_pnl, Decimal("2"))
+        self.assertEqual(len(self.connector.account_positions), 1)
+
+    async def test_missing_or_stale_position_risk_keeps_previous_snapshot_unusable(self):
+        self.connector._api_get.return_value = [position_row()]
+        await self.connector._update_positions()
+        previous = dict(self.connector.account_positions)
+        for changes in [{"unrealizedPnl": None}, {"unrealizedPnl": "NaN"}, {"pricesUpdatedAt": None},
+                        {"pricesUpdatedAt": float("nan")}, {"pricesUpdatedAt": 0},
+                        {"pricesUpdatedAt": int((time.time() - 31) * 1000)}]:
+            with self.subTest(changes=changes):
+                self.connector._api_get.return_value = [position_row(unrealizedPnl="99"), position_row(side="A", **changes)]
+                with self.assertRaises(IOError):
+                    await self.connector._update_positions()
+                self.assertEqual(self.connector.account_positions, previous)
+                self.assertEqual(self.connector._positions_read_at, 0)
+                self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("0"))
+        missing = position_row()
+        del missing["unrealizedPnl"]
+        self.connector._api_get.return_value = [missing]
+        with self.assertRaises(IOError):
+            await self.connector._update_positions()
+
+    async def test_successful_balance_poll_cannot_override_failed_position_poll(self):
+        self.connector._api_get.return_value = [position_row()]
+        await self.connector._update_positions()
+        balance_started, finish_balance = asyncio.Event(), asyncio.Event()
+
+        async def response(path_url, **kwargs):
+            if path_url.endswith("accountSummaries"):
+                balance_started.set()
+                await finish_balance.wait()
+                return [{"accountId": 42, "marginBalance": "1000", "freeCollateral": "900", "pricesUpdatedAt": None}]
+            if path_url.endswith("positions"):
+                return [position_row(unrealizedPnl=None)]
+            return []
+
+        self.connector._api_get.side_effect = response
+        balance_poll = asyncio.create_task(self.connector._update_balances())
+        await balance_started.wait()
+        try:
+            with self.assertRaises(IOError):
+                await self.connector._update_positions()
+        finally:
+            finish_balance.set()
+            await balance_poll
+        self.assertGreater(self.connector._balance_read_at, 0)
+        self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("0"))
+
+    async def test_position_budget_expires_from_price_time_and_recovers_when_empty(self):
+        now = time.time()
+        self.connector._api_get.side_effect = [[position_row(pricesUpdatedAt=int((now - 29) * 1000))],
+                                               [{"accountId": 42, "marginBalance": "1000", "freeCollateral": "900", "pricesUpdatedAt": None}], []]
+        await self.connector._update_positions()
+        await self.connector._update_balances()
+        self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("900"))
+        with patch("hummingbot.connector.derivative.reya_perpetual.reya_perpetual_derivative.time.time", return_value=now + 2):
+            self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("0"))
+        self.connector._api_get.side_effect = None
+        self.connector._api_get.return_value = []
+        await self.connector._update_positions()
+        self.assertEqual(self.connector.account_positions, {})
+        self.assertEqual(self.connector.get_available_balance("RUSD"), Decimal("900"))
+
+    async def test_failed_position_request_invalidates_previously_fresh_positions(self):
+        self.connector._api_get.return_value = [position_row()]
+        await self.connector._update_positions()
+        previous = dict(self.connector.account_positions)
+        self.connector._api_get.side_effect = IOError("request failed")
+        with self.assertRaises(IOError):
+            await self.connector._update_positions()
+        self.assertEqual(self.connector.account_positions, previous)
+        self.assertEqual(self.connector._positions_read_at, 0)
+
+    async def test_wallet_notification_invalidates_both_freshness_guards(self):
+        self.connector._balance_read_at = self.connector._positions_read_at = time.time()
+
+        async def events():
+            yield {"type": "channel_data"}
+
+        self.connector._iter_user_event_queue = events
+        await self.connector._user_stream_event_listener()
+        self.assertEqual(self.connector._balance_read_at, 0)
+        self.assertEqual(self.connector._positions_read_at, 0)
+        self.assertTrue(self.connector._poll_notifier.is_set())
 
     async def test_unknown_account_and_external_orders_fail_budget_closed(self):
         self.connector._api_get.return_value = []

@@ -96,7 +96,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.connector._history = history
         self.assertEqual((await self.connector._request_order_status(order)).new_state, OrderState.FILLED)
         self.assertEqual(order.executed_amount_base, Decimal("1"))
-        self.connector._api_get.side_effect = [[{"accountId": 42, "symbol": "BTCRUSDPERP", "side": "A", "qty": "2", "avgEntryPrice": "101", "unrealizedPnl": "2"}], []]
+        self.connector._api_get.side_effect = [[fixtures.position_row(side="A")], []]
         await self.connector._update_positions()
         self.assertEqual(next(iter(self.connector.account_positions.values())).amount, Decimal("-2"))
         await self.connector._update_positions()
