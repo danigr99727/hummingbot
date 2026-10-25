@@ -31,6 +31,7 @@ class ReyaOrderOutcomeUnknown(IOError):
 
 class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
     web_utils = web_utils
+    LONG_POLL_INTERVAL = 5.0
 
     def __init__(self, balance_asset_limit=None, rate_limits_share_pct=Decimal("100"),
                  reya_perpetual_private_key=None, reya_perpetual_wallet_address=None,
@@ -44,6 +45,10 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         self._market_ids = {}
         self._market_definitions = {}
         self._signing_lock = asyncio.Lock()
+        self._reconciliation_lock = asyncio.Lock()
+        self._last_reconciliation_at = None
+        self._account_state_version = 0
+        self._position_bases = {}
         self._reya_auth = ReyaPerpetualAuth(reya_perpetual_private_key, self._market_ids) if reya_perpetual_private_key else None
         self._balance_read_at = 0
         self._positions_read_at = 0
@@ -356,6 +361,7 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _update_balances(self):
         self._balance_read_at = 0
+        version = self._account_state_version
         await self._validate_signer_authorization()
         rows = await self._api_get(path_url=self._wallet_path("accountSummaries"), params={"accountId": self._account_id})
         if len(rows) != 1 or int(rows[0]["accountId"]) != self._account_id:
@@ -364,12 +370,17 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         timestamp = row.get("pricesUpdatedAt")
         if timestamp is not None and time.time() * 1000 - timestamp > 30000:
             raise IOError("Reya account valuation prices are stale")
-        self._account_balances["RUSD"] = Decimal(row["marginBalance"])
-        self._account_available_balances["RUSD"] = max(Decimal("0"), Decimal(row["freeCollateral"]))
+        balance = Decimal(row["marginBalance"])
+        available = max(Decimal("0"), Decimal(row["freeCollateral"]))
         orders = await self._api_get(path_url=self._wallet_path("openOrders"))
         local_ids = {wire_client_id(order.client_order_id) for order in self.in_flight_orders.values()}
-        self._external_orders = any(int(order["accountId"]) == self._account_id
-                                    and str(order.get("clientOrderId")) not in local_ids for order in orders)
+        external_orders = any(int(order["accountId"]) == self._account_id
+                              and str(order.get("clientOrderId")) not in local_ids for order in orders)
+        if version != self._account_state_version:
+            raise IOError("Reya account changed during balance reconciliation")
+        self._account_balances["RUSD"] = balance
+        self._account_available_balances["RUSD"] = available
+        self._external_orders = external_orders
         self._balance_read_at = time.time()
 
     def get_available_balance(self, currency):
@@ -377,7 +388,7 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
                 or time.time() - self._positions_read_at > 30 or time.time() - self._signer_authorized_at > 30):
             return Decimal("0")
         available = super().get_available_balance(currency)
-        # The API excludes order holds. Reserve each tracked order in full until terminal reconciliation.
+        # Local policy: reserve tracked orders until terminal reconciliation; Reya has no resting-order holds.
         for order in self.in_flight_orders.values():
             price = order.price
             if not price.is_finite() or price <= 0:
@@ -389,35 +400,111 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         # Keep this guard independent of balance polling: a successful balance read
         # must not make missing or stale position valuations usable again.
         self._positions_read_at = 0
+        version = self._account_state_version
         rows = await self._api_get(path_url=self._wallet_path("positions"))
         fresh_at = time.time()
         positions = {}
+        bases = {}
         for row in rows:
             if int(row["accountId"]) != self._account_id:
                 continue
-            timestamp = row.get("pricesUpdatedAt")
-            if (not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp)
-                    or timestamp <= 0 or time.time() * 1000 - timestamp > 30000):
-                raise IOError("Reya position valuation prices are missing or stale")
-            if row.get("unrealizedPnl") is None:
-                raise IOError("Reya position unrealized PnL is unavailable")
-            unrealized_pnl = Decimal(row["unrealizedPnl"])
-            if not unrealized_pnl.is_finite():
-                raise IOError("Reya position unrealized PnL is invalid")
+            quantity = Decimal(row["qty"])
+            if not quantity.is_finite():
+                raise IOError("Reya position quantity is invalid")
+            # A closed position can retain its base row without any valuation.
+            if quantity == 0:
+                continue
+            unrealized_pnl, timestamp = self._position_risk(row)
+            bases[row["symbol"]] = self._position_base(row)
             fresh_at = min(fresh_at, timestamp / 1000)
             pair = await self.trading_pair_associated_to_exchange_symbol(row["symbol"])
             side = PositionSide.LONG if row["side"] == "B" else PositionSide.SHORT
             key = self._perpetual_trading.position_key(pair, side)
             positions[key] = Position(pair, side, unrealized_pnl, Decimal(row["avgEntryPrice"]),
-                                      Decimal(row["qty"]) * (1 if side == PositionSide.LONG else -1),
+                                      quantity * (1 if side == PositionSide.LONG else -1),
                                       Decimal(self.get_leverage(pair)))
         # Validate the complete account snapshot before changing any tracked positions.
+        if version != self._account_state_version:
+            raise IOError("Reya account changed during position reconciliation")
         for key, position in positions.items():
             self._perpetual_trading.set_position(key, position)
         for key in list(self.account_positions):
             if key not in positions:
                 self._perpetual_trading.remove_position(key)
         self._positions_read_at = fresh_at
+        self._position_bases = bases
+
+    @staticmethod
+    def _position_risk(row):
+        timestamp = row.get("pricesUpdatedAt")
+        if (not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp)
+                or timestamp <= 0 or time.time() * 1000 - timestamp > 30000):
+            raise IOError("Reya position valuation prices are missing or stale")
+        if row.get("unrealizedPnl") is None:
+            raise IOError("Reya position unrealized PnL is unavailable")
+        unrealized_pnl = Decimal(row["unrealizedPnl"])
+        if not unrealized_pnl.is_finite():
+            raise IOError("Reya position unrealized PnL is invalid")
+        return unrealized_pnl, timestamp
+
+    @staticmethod
+    def _position_base(row):
+        return tuple(row[field] for field in ("exchangeId", "symbol", "accountId", "qty", "side", "avgEntryPrice",
+                                              "avgEntryFundingValue", "lastTradeSequenceNumber"))
+
+    def _invalidate_account_state(self):
+        self._account_state_version += 1
+        self._balance_read_at = self._positions_read_at = 0
+        self._poll_notifier.set()
+
+    async def _status_polling_loop_fetch_updates(self):
+        # Price-driven wallet frames can arrive much faster than REST's request budget.
+        # Serialize complete cycles, including failures, and let the first one run immediately.
+        async with self._reconciliation_lock:
+            if self._last_reconciliation_at is not None:
+                delay = self.LONG_POLL_INTERVAL - (time.monotonic() - self._last_reconciliation_at)
+                if delay > 0:
+                    await self._sleep(delay)
+            self._last_reconciliation_at = time.monotonic()
+            version = self._account_state_version
+            results = await asyncio.gather(self._update_positions(), self._update_balances(),
+                                           self._update_order_status(), return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            if version != self._account_state_version:
+                # The base loop clears its notifier after success. Keep this change pending.
+                self._invalidate_account_state()
+                raise IOError("Reya account changed during reconciliation")
+
+    def _position_event_invalidates_budget(self, event):
+        snapshot = event["type"] == "subscribed"
+        payload = event["contents"] if snapshot else event
+        rows = payload["data"]
+        unavailable = payload.get("unavailableAccountIds", [])
+        if not isinstance(rows, list) or not isinstance(unavailable, list):
+            raise ValueError("Invalid Reya position notification")
+        invalidates = snapshot or self._account_id in [int(account_id) for account_id in unavailable]
+        bases = {} if snapshot else self._position_bases.copy()
+        for row in rows:
+            if int(row["accountId"]) != self._account_id:
+                continue
+            self._poll_notifier.set()
+            symbol, base = row["symbol"], self._position_base(row)
+            invalidates |= bases.get(symbol) != base
+            if Decimal(row["qty"]) == 0:
+                bases.pop(symbol, None)
+                invalidates = True
+            else:
+                bases[symbol] = base
+            try:
+                self._position_risk(row)
+            except (IOError, ValueError, TypeError, ArithmeticError):
+                invalidates = True
+        # Live frames are upserts; absent rows retain their base state. Remember base
+        # changes now so subsequent valuation frames do not invalidate an in-flight poll.
+        self._position_bases = bases
+        return invalidates
 
     async def _trading_pair_position_mode_set(self, mode, trading_pair):
         return mode == PositionMode.ONEWAY, "Reya supports one-way cross margin only"
@@ -433,9 +520,17 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _user_stream_event_listener(self):
         async for event in self._iter_user_event_queue():
-            # Trigger REST reconciliation for every wallet change. This also handles reconnect snapshots.
-            # Do not treat orderChanges.cumQty or executionBusts as settled fills.
-            if event.get("type") in ("subscribed", "channel_data"):
-                self._balance_read_at = 0
-                self._positions_read_at = 0
-                self._poll_notifier.set()
+            try:
+                if event.get("type") in ("error", "reya_stream_interrupted"):
+                    self._invalidate_account_state()
+                elif event.get("type") in ("subscribed", "channel_data"):
+                    channel = event.get("channel", "").lower()
+                    if channel == ("/v2/" + self._wallet_path("positions")).lower():
+                        if self._position_event_invalidates_budget(event):
+                            self._invalidate_account_state()
+                    else:
+                        # Execution, order and cash events require fresh settled state.
+                        # Neither orderChanges.cumQty nor executionBusts creates a fill.
+                        self._invalidate_account_state()
+            except (KeyError, ValueError, TypeError, AttributeError, ArithmeticError):
+                self._invalidate_account_state()

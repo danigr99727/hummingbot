@@ -27,6 +27,11 @@ class ReyaPerpetualAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await websocket_assistant.send(WSJSONRequest(payload={"type": "ping"}))
 
     async def _process_websocket_messages(self, websocket_assistant, queue):
-        async for message in web_utils.websocket_messages(websocket_assistant):
-            if message.get("type") in ("subscribed", "channel_data"):
-                queue.put_nowait(message)
+        try:
+            async for message in web_utils.websocket_messages(websocket_assistant):
+                if message.get("type") in ("subscribed", "channel_data"):
+                    queue.put_nowait(message)
+        finally:
+            # The shared parser raises on channel errors and disconnects. Invalidate
+            # cached risk immediately, before the transport's reconnect delay.
+            queue.put_nowait({"type": "reya_stream_interrupted"})

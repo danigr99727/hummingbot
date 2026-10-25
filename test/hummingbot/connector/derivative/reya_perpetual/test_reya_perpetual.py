@@ -20,7 +20,8 @@ MARKET = {"symbol": "BTCRUSDPERP", "marketId": 2, "status": "TRADING", "qtyStepS
 
 
 def position_row(**changes):
-    return {"accountId": 42, "symbol": "BTCRUSDPERP", "side": "B", "qty": "2", "avgEntryPrice": "101",
+    return {"accountId": 42, "exchangeId": 2, "symbol": "BTCRUSDPERP", "side": "B", "qty": "2", "avgEntryPrice": "101",
+            "avgEntryFundingValue": "0", "lastTradeSequenceNumber": 7,
             "unrealizedPnl": "2", "pricesUpdatedAt": int(time.time() * 1000), **changes}
 
 
