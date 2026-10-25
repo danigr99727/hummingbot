@@ -31,7 +31,7 @@ class ReyaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
         data = await self._connector._api_get(path_url=f"perpMarket/{symbol}/summary")
         return FundingInfo(trading_pair, Decimal(data["oraclePrice"]), Decimal(data["markPrice"]),
-                           0, Decimal(data["fundingRate"]))
+                           0, Decimal(data["fundingRate"]) / 100)
 
     async def _order_book_snapshot(self, trading_pair):
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
@@ -148,6 +148,6 @@ class ReyaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         pair = await self._connector.trading_pair_associated_to_exchange_symbol(data["symbol"])
         message_queue.put_nowait(FundingInfoUpdate(
             trading_pair=pair, index_price=Decimal(data["oraclePrice"]) if "oraclePrice" in data else None,
-            mark_price=Decimal(data["markPrice"]), rate=Decimal(data["fundingRate"]),
+            mark_price=Decimal(data["markPrice"]), rate=Decimal(data["fundingRate"]) / 100,
             next_funding_utc_timestamp=0,  # Reya funding accrues continuously, with no scheduled settlement.
         ))

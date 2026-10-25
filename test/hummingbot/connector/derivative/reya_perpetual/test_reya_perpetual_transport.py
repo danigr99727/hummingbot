@@ -124,7 +124,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws.send.await_count, 3)
         self.connector._api_get.side_effect = [{"bids": [{"px": "100", "qty": "1"}], "asks": [], "updatedAt": 1000}, {"oraclePrice": "99", "markPrice": "100", "fundingRate": "0.0001"}]
         self.assertEqual((await source._order_book_snapshot("BTC-RUSD")).bids[0].price, 100)
-        self.assertEqual((await source.get_funding_info("BTC-RUSD")).rate, Decimal("0.0001"))
+        self.assertEqual((await source.get_funding_info("BTC-RUSD")).rate, Decimal("0.000001"))
         queue = asyncio.Queue()
         trade = {"symbol": "BTCRUSDPERP", "sequenceNumber": 5, "side": "B", "price": "100", "qty": "1", "timestamp": 1000}
         await source._parse_trade_message({"type": "subscribed", "contents": {"data": [trade]}}, queue)
