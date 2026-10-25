@@ -47,6 +47,7 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         self._reya_auth = ReyaPerpetualAuth(reya_perpetual_private_key, self._market_ids) if reya_perpetual_private_key else None
         self._balance_read_at = 0
         self._positions_read_at = 0
+        self._signer_authorized_at = 0
         self._external_orders = False
         self._maker_fee = Decimal("0")
         self._taker_fee = Decimal("0.0003")
@@ -323,8 +324,39 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
         return OrderUpdate(tracked_order.trading_pair, row["lastUpdateAt"] / 1000, state,
                            tracked_order.client_order_id, str(row["orderId"]))
 
+    async def _validate_signer_authorization(self):
+        self._signer_authorized_at = 0
+        if self._reya_auth is None:
+            raise IOError("A Reya signer private key is required")
+        url = web_utils.api_wallet_status_url(self._wallet, self.domain)
+        signer = self._reya_auth.signer_address.lower()
+        # OrdersGateway always permits the owner; no delegate grant is needed.
+        # _update_balances separately verifies that this wallet owns the account.
+        if signer == self._wallet.lower():
+            self._signer_authorized_at = time.time()
+            return
+        try:
+            # Bound throttling, transport and response decoding together. The
+            # request uses the normal REST assistant and shared request budget.
+            async with asyncio.timeout(CONSTANTS.SIGNER_VALIDATION_TIMEOUT):
+                assistant = await self._web_assistants_factory.get_rest_assistant()
+                response = await assistant.execute_request(
+                    url=url, method=RESTMethod.GET, is_auth_required=False,
+                    throttler_limit_id=CONSTANTS.RATE_LIMIT_ID,
+                    timeout=CONSTANTS.SIGNER_VALIDATION_TIMEOUT,
+                )
+        except (TimeoutError, IOError, ValueError) as error:
+            raise IOError("Unable to verify Reya signer authorization") from error
+        delegates = response.get("enabledApiWallets") if isinstance(response, dict) else None
+        if not isinstance(delegates, list) or not all(web_utils.is_wallet_address(address) for address in delegates):
+            raise IOError("Invalid Reya signer authorization response")
+        if signer not in {address.lower() for address in delegates}:
+            raise IOError("Configured Reya signer is not authorized for this owner wallet")
+        self._signer_authorized_at = time.time()
+
     async def _update_balances(self):
         self._balance_read_at = 0
+        await self._validate_signer_authorization()
         rows = await self._api_get(path_url=self._wallet_path("accountSummaries"), params={"accountId": self._account_id})
         if len(rows) != 1 or int(rows[0]["accountId"]) != self._account_id:
             raise IOError("Configured perpetual account does not belong to this wallet")
@@ -342,7 +374,7 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
 
     def get_available_balance(self, currency):
         if (currency != "RUSD" or self._external_orders or time.time() - self._balance_read_at > 30
-                or time.time() - self._positions_read_at > 30):
+                or time.time() - self._positions_read_at > 30 or time.time() - self._signer_authorized_at > 30):
             return Decimal("0")
         available = super().get_available_balance(currency)
         # The API excludes order holds. Reserve each tracked order in full until terminal reconciliation.

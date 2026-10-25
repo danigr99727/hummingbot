@@ -2,6 +2,8 @@ from hummingbot.core.api_throttler.data_types import RateLimit
 
 DEFAULT_DOMAIN = "reya_perpetual"
 REST_URL = "https://api.reya.xyz/v2/"
+LEGACY_REST_URL = "https://api.reya.xyz/api/trading/"
+SIGNER_VALIDATION_TIMEOUT = 10
 WS_URL = "wss://ws.reya.xyz"
 ORDERS_GATEWAY = "0xfc8c96be87da63cecddbf54abfa7b13ee8044739"
 CHAIN_ID = 1729

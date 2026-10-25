@@ -42,6 +42,10 @@ class ReyaPerpetualAuth(AuthBase):
         self._domain = {"name": "Reya", "version": "1", "verifyingContract": gateway}
         self._last_nonce = 0
 
+    @property
+    def signer_address(self) -> str:
+        return self._wallet.address
+
     def nonce(self):
         self._last_nonce = max(time.time_ns() // 1000, self._last_nonce + 1)
         return self._last_nonce

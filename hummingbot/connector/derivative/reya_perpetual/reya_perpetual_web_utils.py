@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from hummingbot.connector.derivative.reya_perpetual import reya_perpetual_constants as CONSTANTS
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
@@ -14,6 +15,18 @@ def public_rest_url(path_url, domain=CONSTANTS.DEFAULT_DOMAIN):
 
 def private_rest_url(path_url, domain=CONSTANTS.DEFAULT_DOMAIN):
     return public_rest_url(path_url, domain)
+
+
+def is_wallet_address(address):
+    return isinstance(address, str) and re.fullmatch(r"0x[0-9a-f]{40}", address, re.IGNORECASE) is not None
+
+
+def api_wallet_status_url(address, domain=CONSTANTS.DEFAULT_DOMAIN):
+    if domain != CONSTANTS.DEFAULT_DOMAIN:
+        raise ValueError(f"Unsupported Reya domain: {domain}")
+    if not is_wallet_address(address) or int(address, 16) == 0:
+        raise ValueError("A non-zero owner wallet address is required")
+    return CONSTANTS.LEGACY_REST_URL + f"wallet/{address.lower()}/apiWalletStatus"
 
 
 def build_api_factory(throttler=None, auth=None):

@@ -52,7 +52,8 @@ class AuthTests(unittest.TestCase):
 class ConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.connector = ReyaPerpetualDerivative(reya_perpetual_private_key=VECTORS["PRIVATE_KEY"],
-                                                 reya_perpetual_wallet_address="0x" + "1" * 40, reya_perpetual_account_id="42", trading_pairs=["BTC-RUSD"])
+                                                 reya_perpetual_wallet_address=ReyaPerpetualAuth(VECTORS["PRIVATE_KEY"], {}).signer_address,
+                                                 reya_perpetual_account_id="42", trading_pairs=["BTC-RUSD"])
         self.connector._set_current_timestamp(1700000000)
         rules = await self.connector._format_trading_rules([MARKET])
         self.connector._trading_rules = {r.trading_pair: r for r in rules}
