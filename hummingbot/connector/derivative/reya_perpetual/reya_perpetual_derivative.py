@@ -388,7 +388,7 @@ class ReyaPerpetualDerivative(PerpetualDerivativePyBase):
                 or time.time() - self._positions_read_at > 30 or time.time() - self._signer_authorized_at > 30):
             return Decimal("0")
         available = super().get_available_balance(currency)
-        # Local policy: reserve tracked orders until terminal reconciliation; Reya has no resting-order holds.
+        # Local policy: reserve tracked orders until terminal settlement reconciliation.
         for order in self.in_flight_orders.values():
             price = order.price
             if not price.is_finite() or price <= 0:
